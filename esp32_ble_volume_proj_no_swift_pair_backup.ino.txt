@@ -1,0 +1,528 @@
+#include <HijelHID_BLEKeyboard.h>
+#include <Adafruit_NeoPixel.h>
+#include <RotaryEncoder.h>
+
+// --- PIN DEFINITIONS ---
+// You can adjust these if your wiring is different
+#define ENCODER_CLK  5
+#define ENCODER_DT   6
+#define ENCODER_SW   7
+#define NEOPIXEL_PIN 4
+#define BOOT_BUTTON_PIN 9 // The ESP32-C3 onboard BOOT button
+#define HAPTIC_PIN 10     // Vibration motor pin
+#define TOUCH_PIN_1  20   // Multi-tap touch sensor (Media Control)
+#define TOUCH_PIN_2  21   // Brightness mode toggle
+#define NUMPIXELS 8
+
+// --- SETTINGS ---
+// Set to true if you are mounting the NeoPixel ring upside-down (face down) over the encoder.
+// This reverses the LED animation direction so it visually matches your physical rotation.
+#define RING_UPSIDE_DOWN true
+
+// Default RGB Color for the rotating LED (0-255)
+// Currently set to Fire Red
+#define DEFAULT_COLOR_R 255
+#define DEFAULT_COLOR_G 35
+#define DEFAULT_COLOR_B 0
+
+// Vibration Motor Settings (in milliseconds)
+// How long the motor vibrates when turning the knob
+#define HAPTIC_ROTATION_MS 80
+// How long the motor vibrates when pressing the mute button
+#define HAPTIC_MUTE_MS 110
+
+// Keyboard Control Mode
+// Set to true to send Left/Right Arrow keyboard keys when turning the knob (great for YouTube scrubbing).
+// Set to false to send standard Media Volume Up/Volume Down.
+#define USE_KEYBOARD_ARROWS false
+
+// Touch Sensor Modules
+// Set to true to enable the external touch sensor module.
+// Touch 1 (Pin 20): Single Tap = Play/Pause | Double Tap = Next Track | Triple Tap = Prev Track
+// Touch 2 (Pin 21): Toggle Brightness Mode
+#define ENABLE_TOUCH_SENSORS false
+
+// --- OBJECTS ---
+// Initialize BLE Keyboard (Name, Manufacturer, Initial Battery Level)
+HijelHID_BLEKeyboard bleKeyboard("ESP32 kunsh Media Controller", "kunsh", 100);
+
+// Initialize NeoPixel ring
+Adafruit_NeoPixel pixels(NUMPIXELS, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
+
+// Initialize RotaryEncoder (Matthias Hertel library)
+// FOUR3 is the standard 4-step-per-notch mode for most cheap EC11 bare encoders
+RotaryEncoder encoder(ENCODER_DT, ENCODER_CLK, RotaryEncoder::LatchMode::FOUR3);
+
+// Interrupt service routine for the encoder
+void IRAM_ATTR checkPosition() {
+  encoder.tick();
+}
+
+// --- STATE VARIABLES ---
+int currentPixel = 0;
+uint32_t modeColor;
+bool wasConnected = false; // Tracks if we have already played the connection animation
+bool pairingHapticTriggered = false; // Tracks if we have already vibrated for the pairing request
+unsigned long pairingRequestStartTime = 0; // Tracks how long we've been waiting for a pairing handshake
+bool isMuted = false;      // Tracks if we are currently muted
+bool isIdle = true;        // Tracks if the LEDs are currently sleeping
+bool ledsEnabled = true;   // Master toggle for all NeoPixels
+unsigned long lastInteractionTime = 0; // Tracks inactivity for auto-off
+int currentBrightness = 50; // Master brightness (0-255)
+bool isBrightnessMode = false; // Are we currently adjusting brightness?
+
+// Debouncing timers
+unsigned long lastButtonPress = 0;
+const unsigned long debounceDelay = 300; // milliseconds
+bool lastButtonState = HIGH;
+
+// Boot Button State
+bool lastBootButtonState = HIGH;
+unsigned long bootButtonDownTime = 0;
+bool longPressTriggered = false;
+
+// Multi-tap state for Touch Sensor 1
+bool lastTouch1State = LOW; // Assuming active-high TTP223 touch sensors
+int touch1TapCount = 0;
+unsigned long lastTouch1TapTime = 0;
+const unsigned long tapTimeoutDelay = 400; // ms to wait before executing taps
+
+// State for Touch Sensor 2
+bool lastTouch2State = LOW;
+unsigned long lastTouch2Press = 0;
+
+// Encoder state
+int lastClk = HIGH; // (Legacy state var, no longer heavily relied upon)
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Start NeoPixels FIRST, before any BLE or interrupts to ensure RMT configures correctly
+  pixels.begin();
+  pixels.setBrightness(currentBrightness); 
+  pixels.clear();
+  pixels.show();
+  
+  delay(1000); // Give the LED ring 1 second to power up properly
+
+  // Boot Animation: Fire Orange (255, 69, 0) Breathe ONCE
+  // Using a sine wave from 0 to 180 degrees ensures it starts at 0 and fades perfectly back to 0
+  for (int j = 0; j <= 180; j += 1) {
+    float breath = sin(j * PI / 180.0);
+    uint8_t r = 255 * breath;
+    uint8_t g = 69 * breath;
+    for(int i=0; i<NUMPIXELS; i++) {
+      pixels.setPixelColor(i, pixels.Color(r, g, 0));
+    }
+    pixels.show();
+    delay(10);
+  }
+  
+  pixels.clear();
+  pixels.show();
+
+  // Setup Encoder pins (MUST use INPUT_PULLUP for bare encoders to prevent floating noise!)
+  pinMode(ENCODER_SW, INPUT_PULLUP);
+  pinMode(ENCODER_DT, INPUT_PULLUP);
+  pinMode(ENCODER_CLK, INPUT_PULLUP);
+  pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
+  
+  pinMode(HAPTIC_PIN, OUTPUT);
+  digitalWrite(HAPTIC_PIN, LOW); // Ensure motor is off at boot
+  
+  // Attach interrupts for the rotary encoder to handle bouncing perfectly in software
+  attachInterrupt(digitalPinToInterrupt(ENCODER_DT), checkPosition, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_CLK), checkPosition, CHANGE);
+  
+  if (ENABLE_TOUCH_SENSORS) {
+    pinMode(TOUCH_PIN_1, INPUT);
+    pinMode(TOUCH_PIN_2, INPUT);
+  }
+  
+  // Start BLE
+  Serial.println("Starting BLE Keyboard...");
+  bleKeyboard.begin();
+  
+  // Set default mode color using user settings
+  modeColor = pixels.Color(DEFAULT_COLOR_R, DEFAULT_COLOR_G, DEFAULT_COLOR_B); 
+}
+
+// Function to quickly flash a color (e.g. for Mode Switch)
+void showModeFlash() {
+  uint32_t color = USE_KEYBOARD_ARROWS ? pixels.Color(128, 0, 128) : pixels.Color(DEFAULT_COLOR_R, DEFAULT_COLOR_G, DEFAULT_COLOR_B); 
+  for(int i=0; i<NUMPIXELS; i++) {
+    pixels.setPixelColor(i, color);
+  }
+  pixels.show();
+  delay(200);
+  pixels.clear();
+  pixels.show();
+}
+
+// Function to flash a solid color across all LEDs
+void flashColor(uint32_t color) {
+  for(int i=0; i<NUMPIXELS; i++) {
+    pixels.setPixelColor(i, color);
+  }
+  pixels.show();
+  delay(150);
+  pixels.clear();
+  pixels.show();
+}
+
+// Function to draw a spinning dot based on rotation direction
+void spinAnimation(int dir) {
+  pixels.clear();
+  
+  // If the ring is physically mounted upside down, mirror the animation direction
+  if (RING_UPSIDE_DOWN) {
+    dir = -dir;
+  }
+  
+  // If we were sleeping, wake up on the exact same LED instead of jumping forward
+  if (!isIdle) {
+    if (dir > 0) {
+      currentPixel = (currentPixel + 1) % NUMPIXELS;
+    } else {
+      currentPixel = (currentPixel - 1 + NUMPIXELS) % NUMPIXELS;
+    }
+  }
+  isIdle = false; // We are now awake
+  
+  // Draw the bright head
+  pixels.setPixelColor(currentPixel, modeColor);
+  
+  // Draw a very short, dim tail so the movement looks like a tiny comet instead of choppy
+  uint8_t mr = (modeColor >> 16) & 0xFF;
+  uint8_t mg = (modeColor >> 8) & 0xFF;
+  uint8_t mb = modeColor & 0xFF;
+  int tailPixel = dir > 0 ? (currentPixel - 1 + NUMPIXELS) % NUMPIXELS : (currentPixel + 1) % NUMPIXELS;
+  pixels.setPixelColor(tailPixel, pixels.Color(mr/4, mg/4, mb/4));
+  
+  if (ledsEnabled) {
+    pixels.show();
+  }
+}
+
+// --- HAPTIC FEEDBACK ---
+unsigned long hapticStartTime = 0;
+unsigned long hapticDuration = 0;
+bool hapticActive = false;
+unsigned long lastHapticStopTime = 0; // Tracks when the motor last turned off to ignore ghost inputs
+
+void triggerHaptic(unsigned long durationMs = 30) {
+  // If we are already vibrating, don't restart the timer if the new request is the same or shorter.
+  // This prevents the motor from being held at 100% continuously if you spin the encoder very fast!
+  if (hapticActive && durationMs <= hapticDuration) {
+    return;
+  }
+  digitalWrite(HAPTIC_PIN, HIGH);
+  hapticActive = true;
+  hapticStartTime = millis();
+  hapticDuration = durationMs;
+}
+
+void loop() {
+  // Update encoder in the main loop as well for safety
+  encoder.tick();
+
+  // Handle non-blocking haptic motor turn off (using subtraction prevents millis() rollover bugs)
+  if (hapticActive && (millis() - hapticStartTime >= hapticDuration)) {
+    digitalWrite(HAPTIC_PIN, LOW);
+    hapticActive = false;
+    lastHapticStopTime = millis();
+  }
+
+  if (bleKeyboard.isPaired()) {
+    pairingRequestStartTime = 0; // Reset pairing request timer
+    
+    // Check if we just connected
+    if (!wasConnected) {
+      // Just connected! Breathe green twice
+      for (int loops = 0; loops < 2; loops++) {
+        for (int j = 0; j <= 180; j += 3) { // Faster breathe for the connection success
+          float breath = sin(j * PI / 180.0);
+          uint8_t g_val = 255 * breath;
+          for(int i=0; i<NUMPIXELS; i++) {
+            pixels.setPixelColor(i, pixels.Color(0, g_val, 0));
+          }
+          if (ledsEnabled) pixels.show();
+          delay(8);
+        }
+      }
+      pixels.clear();
+      if (ledsEnabled) pixels.show();
+      wasConnected = true;
+      lastInteractionTime = millis();
+    }
+    
+    // --- 1. READ ROTARY ENCODER ---
+    int newPos = encoder.getPosition();
+    if (newPos != 0) {
+      triggerHaptic(HAPTIC_ROTATION_MS);
+      if (encoder.getDirection() == RotaryEncoder::Direction::CLOCKWISE) {
+        // Clockwise Rotation
+        if (isBrightnessMode) {
+          currentBrightness = min(255, currentBrightness + 15);
+          pixels.setBrightness(currentBrightness);
+          for(int i=0; i<NUMPIXELS; i++) pixels.setPixelColor(i, modeColor);
+          if (ledsEnabled) pixels.show();
+        } else {
+          if (USE_KEYBOARD_ARROWS) bleKeyboard.tap(KEY_RIGHT);
+          else bleKeyboard.tap(MEDIA_VOLUME_UP);
+          spinAnimation(1); // Spin forwards
+        }
+      } else {
+        // Counter-clockwise Rotation
+        if (isBrightnessMode) {
+          currentBrightness = max(5, currentBrightness - 15);
+          pixels.setBrightness(currentBrightness);
+          for(int i=0; i<NUMPIXELS; i++) pixels.setPixelColor(i, modeColor);
+          if (ledsEnabled) pixels.show();
+        } else {
+          if (USE_KEYBOARD_ARROWS) bleKeyboard.tap(KEY_LEFT);
+          else bleKeyboard.tap(MEDIA_VOLUME_DOWN);
+          spinAnimation(-1); // Spin backwards
+        }
+      }
+      
+      // Reset the position to 0 to act as a relative encoder
+      encoder.setPosition(0);
+      lastInteractionTime = millis(); // Reset idle timer
+      isMuted = false; // Turning volume implicitly unmutes the PC, so we reset our red breathing state too
+    }
+    
+    // Check if we are currently safe from vibration noise (mechanical bouncing / electrical spikes)
+    bool isSafeFromVibration = !hapticActive && (millis() - lastHapticStopTime > 250);
+    
+    // --- 2. READ ENCODER BUTTON (MUTE) ---
+    bool currentButtonState = digitalRead(ENCODER_SW);
+    if (isSafeFromVibration && currentButtonState == LOW && lastButtonState == HIGH) { // Button just pressed down
+      if (millis() - lastButtonPress > debounceDelay) {
+        triggerHaptic(HAPTIC_MUTE_MS);
+        
+        bleKeyboard.tap(MEDIA_MUTE);
+        isMuted = !isMuted; // Toggle local mute state
+        if (!isMuted) {
+           pixels.clear(); // Instantly clear the red breathe if we just unmuted
+           if (ledsEnabled) pixels.show();
+        }
+        
+        lastInteractionTime = millis();
+        lastButtonPress = millis();
+      }
+    }
+    lastButtonState = currentButtonState;
+    
+    // --- 3. READ BOOT BUTTON (RGB TOGGLE & DISCONNECT) ---
+    bool currentBootButtonState = digitalRead(BOOT_BUTTON_PIN);
+    
+    // Detect button press down
+    if (isSafeFromVibration && currentBootButtonState == LOW && lastBootButtonState == HIGH) {
+      bootButtonDownTime = millis();
+      longPressTriggered = false;
+    }
+    
+    // While button is held down
+    if (currentBootButtonState == LOW) {
+      // If held for 2 seconds (2000ms) and we haven't triggered the long press yet
+      if (millis() - bootButtonDownTime > 2000 && !longPressTriggered) {
+        longPressTriggered = true;
+        triggerHaptic(200); // Long confirmation vibration
+        
+        // Force disconnect, clear bonds, and restart pairing mode
+        bleKeyboard.end();
+        NimBLEDevice::deleteAllBonds(); // Clear saved pairings to prevent instant auto-reconnect
+        delay(100);
+        bleKeyboard.begin();
+        wasConnected = false;
+        
+        // Flash Red to indicate disconnect
+        flashColor(pixels.Color(255, 0, 0));
+      }
+    }
+    
+    // Detect button release
+    if (currentBootButtonState == HIGH && lastBootButtonState == LOW) {
+      // If it was a short press (debounced, but less than 2 seconds)
+      if (!longPressTriggered && millis() - bootButtonDownTime > 50) {
+        ledsEnabled = !ledsEnabled; // Toggle LED master flag
+        if (!ledsEnabled) {
+           pixels.clear(); // Immediately turn off LEDs
+           pixels.show();
+        } else {
+           // Immediately wake them up to show current position
+           pixels.setPixelColor(currentPixel, modeColor);
+           pixels.show();
+           lastInteractionTime = millis();
+        }
+      }
+    }
+    lastBootButtonState = currentBootButtonState;
+
+    // --- 4. READ TOUCH SENSORS (MULTI-TAP LOGIC) ---
+    if (ENABLE_TOUCH_SENSORS) {
+      bool currentTouch1 = digitalRead(TOUCH_PIN_1);
+      
+      // Detect rising edge (finger touched)
+      if (isSafeFromVibration && currentTouch1 == HIGH && lastTouch1State == LOW) {
+        // Basic debounce: ignore touches that are way too fast
+        if (millis() - lastTouch1TapTime > 50) { 
+          touch1TapCount++;
+          lastTouch1TapTime = millis();
+        }
+      }
+      lastTouch1State = currentTouch1;
+
+      // Check if tap timeout has expired to execute the command
+      if (touch1TapCount > 0 && (millis() - lastTouch1TapTime > tapTimeoutDelay)) {
+        if (touch1TapCount == 1) {
+          // Single Tap: Play/Pause
+          triggerHaptic(90);
+          bleKeyboard.tap(MEDIA_PLAY_PAUSE);
+          flashColor(pixels.Color(0, 255, 0)); // Flash Green
+        } 
+        else if (touch1TapCount == 2) {
+          // Double Tap: Next Track
+          triggerHaptic(120); // Slightly longer haptic for next
+          bleKeyboard.tap(MEDIA_NEXT_TRACK);
+          flashColor(pixels.Color(255, 165, 0)); // Flash Orange
+        } 
+        else if (touch1TapCount >= 3) {
+          // Triple+ Tap: Previous Track
+          triggerHaptic(150); // Longest haptic for prev
+          bleKeyboard.tap(MEDIA_PREV_TRACK);
+          flashColor(pixels.Color(255, 0, 255)); // Flash Magenta
+        }
+        
+        lastInteractionTime = millis();
+        touch1TapCount = 0; // Reset tap counter after executing
+      }
+
+      // Touch Sensor 2: Brightness Mode Toggle
+      bool currentTouch2 = digitalRead(TOUCH_PIN_2);
+      if (isSafeFromVibration && currentTouch2 == HIGH && lastTouch2State == LOW) {
+        if (millis() - lastTouch2Press > debounceDelay) {
+          triggerHaptic(100);
+          isBrightnessMode = !isBrightnessMode;
+          
+          if (isBrightnessMode) {
+            // Enter Brightness Mode: Fade up all other LEDs
+            isIdle = false; // Ensure we are awake
+            for (int b = 0; b <= 255; b += 15) {
+              for (int i = 0; i < NUMPIXELS; i++) {
+                if (i != currentPixel) {
+                  uint8_t mr = (modeColor >> 16) & 0xFF;
+                  uint8_t mg = (modeColor >> 8) & 0xFF;
+                  uint8_t mb = modeColor & 0xFF;
+                  pixels.setPixelColor(i, pixels.Color((mr * b)/255, (mg * b)/255, (mb * b)/255));
+                }
+              }
+              if (ledsEnabled) pixels.show();
+              delay(15);
+            }
+            // Ensure full ring is bright
+            for(int i=0; i<NUMPIXELS; i++) pixels.setPixelColor(i, modeColor);
+            if (ledsEnabled) pixels.show();
+          } else {
+            // Exit Brightness Mode: Fade out all other LEDs
+            for (int b = 255; b >= 0; b -= 15) {
+              for (int i = 0; i < NUMPIXELS; i++) {
+                if (i != currentPixel) {
+                  uint8_t mr = (modeColor >> 16) & 0xFF;
+                  uint8_t mg = (modeColor >> 8) & 0xFF;
+                  uint8_t mb = modeColor & 0xFF;
+                  pixels.setPixelColor(i, pixels.Color((mr * b)/255, (mg * b)/255, (mb * b)/255));
+                }
+              }
+              if (ledsEnabled) pixels.show();
+              delay(15);
+            }
+            // Ensure only current pixel is on
+            pixels.clear();
+            pixels.setPixelColor(currentPixel, modeColor);
+            if (ledsEnabled) pixels.show();
+          }
+          
+          lastInteractionTime = millis();
+          lastTouch2Press = millis();
+        }
+      }
+      lastTouch2State = currentTouch2;
+    }
+
+    // --- LED IDLE & MUTE STATE MANAGEMENT ---
+    if (isMuted) {
+      // Continuous Red Breathing while Muted
+      // The - (PI/2.0) phase shift combined with the lastButtonPress delta ensures it ALWAYS starts exactly at 0 brightness
+      float breath = (exp(sin((millis() - lastButtonPress)/1500.0 * PI - (PI/2.0))) - 0.36787944) * 108.0;
+      for(int i=0; i<NUMPIXELS; i++) {
+        pixels.setPixelColor(i, pixels.Color(breath, 0, 0));
+      }
+      if (ledsEnabled) pixels.show();
+      delay(10); // Small delay to prevent flickering
+    } else if (!isBrightnessMode) {
+      // Normal state: Turn off all LEDs if idle for 1.5 seconds (skip if in brightness mode)
+      if (millis() - lastInteractionTime > 1500) {
+        if (!isIdle) {
+          // Smoothly fade out the current pixels before turning off
+          for (int b = 255; b >= 0; b -= 15) {
+            uint8_t mr = (modeColor >> 16) & 0xFF;
+            uint8_t mg = (modeColor >> 8) & 0xFF;
+            uint8_t mb = modeColor & 0xFF;
+            // Dim the head
+            pixels.setPixelColor(currentPixel, pixels.Color((mr * b)/255, (mg * b)/255, (mb * b)/255));
+            // Let the tail naturally clear during the fade loop for a cleaner look
+            if (ledsEnabled) pixels.show();
+            delay(15);
+            
+            // OPTIMIZATION: Break out of the sleep animation instantly if the user touches the knob!
+            // This prevents the device from feeling laggy if touched exactly while going to sleep.
+            if (encoder.getPosition() != 0 || digitalRead(ENCODER_SW) == LOW) {
+              break;
+            }
+          }
+          pixels.clear();
+          if (ledsEnabled) pixels.show();
+          isIdle = true;
+        }
+      }
+    }
+    
+  } else if (bleKeyboard.isConnected()) {
+    // --- PAIRING REQUEST STATE ---
+    
+    if (pairingRequestStartTime == 0) {
+      pairingRequestStartTime = millis();
+    }
+    
+    // Only vibrate if we have been stuck in the "Connected but not Paired" state for >600ms.
+    // This prevents the motor from vibrating during fast auto-reconnections to known devices!
+    if (!pairingHapticTriggered && (millis() - pairingRequestStartTime > 600)) {
+      triggerHaptic(500); // 500ms strong vibration to alert the user to look at their phone
+      pairingHapticTriggered = true;
+    }
+    
+    // FAST breathing blue animation to indicate pairing urgency
+    float breath = (exp(sin(millis()/150.0*PI)) - 0.36787944)*108.0; 
+    for(int i=0; i<NUMPIXELS; i++) {
+      pixels.setPixelColor(i, pixels.Color(0, 0, breath));
+    }
+    if (ledsEnabled) pixels.show();
+    delay(10);
+    
+  } else {
+    // --- DISCONNECTED STATE ---
+    wasConnected = false;           // Reset the success connection state
+    pairingHapticTriggered = false; // Reset the pairing vibration state
+    pairingRequestStartTime = 0;    // Reset the pairing request timer
+    
+    // SLOW breathing blue animation while passively waiting for a connection
+    float breath = (exp(sin(millis()/2000.0*PI)) - 0.36787944)*108.0;
+    for(int i=0; i<NUMPIXELS; i++) {
+      pixels.setPixelColor(i, pixels.Color(0, 0, breath));
+    }
+    if (ledsEnabled) pixels.show();
+    delay(10);
+  }
+}

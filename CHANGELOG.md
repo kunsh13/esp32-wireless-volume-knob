@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2026-06-26 17:00:00 IST]
+
+### Fixed
+- **Left Touch Singular LED Bug**: Fixed a state machine bug where interrupting a sleep fade-out with a media tap would incorrectly leave a single LED fully lit. The device now explicitly forces the ring back to sleep (completely dark) after the touch flash animation.
+- **Visual "Headless Comet" Restore**: Upgraded the `restoreLEDState()` logic so that if the ring is ever woken up during a transient interaction, it properly reconstructs the entire volume comet (head and tail), rather than only drawing a solitary "head" LED.
+- **Synchronous Global Fade-outs**: Replaced the manual pixel dimming loop (which left the comet tail lingering out of sync) with the NeoPixel library's `setBrightness()`. This guarantees that when the device goes to sleep, every active LED on the ring fades out perfectly in sync at the exact same pace.
+
 ## [2026-06-26 15:45:00 IST]
 
 ### Added
@@ -23,7 +30,9 @@ All notable changes to this project will be documented in this file.
 - **Brightness Mute-Desync Bug**: Fixed a logic desync where rotating the encoder to adjust brightness would inadvertently clear the hardware mute flag without actually unmuting the PC audio.
 - **Touch Sensor Logs**: Updated the serial monitor debugging statements to accurately report double and triple taps, rather than eagerly logging every physical touch as a single tap.
 
-## [2026-06-26 13:20:00 IST]### Fixed
+## [2026-06-26 13:20:00 IST]
+
+### Fixed
 - **Double-Mute Bug**: Fixed an issue where the second press during the "press-once-then-press-and-hold" disconnect sequence would trigger an unintended secondary audio mute event on the host PC. Muting now strictly only occurs on the first tap.
 - **Unpair Button Logic**: Simplified and fixed the internal state machine for the disconnection sequence, preventing the sequence from requiring inhumanly fast clicking speeds and removing buggy sticky state variables. Increased the double-tap window to 800ms.
 - **Boot Crash / Bootloop**: Fixed a severe logic flaw where the hardware unpair logic incorrectly nested the entire loop logic. Deleted a corrupted `partitions.csv` file that previously caused the ESP32-C3 to instantly kernel panic upon boot due to attempting to map 16MB of flash partitions on a 4MB hardware chip.

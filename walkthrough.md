@@ -12,30 +12,31 @@ Your custom ESP32-C3 Supermini has been significantly upgraded and optimized!
 ### Rotary Encoder (Knob)
 * **Rotate Clockwise:** Volume Up (or Right Arrow)
 * **Rotate Counter-Clockwise:** Volume Down (or Left Arrow)
+* **Dynamic Acceleration:** Spinning the knob faster increases the volume step size to quickly jump to 0 or 100.
 * **Press:** Mute / Unmute
-* *Haptics:* Crisp 80ms vibration per tick, 110ms vibration for mute presses.
+* **Double-Tap & Hold (3 seconds):** Force disconnect! The device will drop the Bluetooth connection, flash a double-green animation, and re-enter Pairing Mode.
+* *Haptics:* Crisp 80ms vibration per tick, distinct 110ms double-vibration for mute presses.
 
 ### Boot Button (Pin 9)
 * **Short Press:** Master toggle to instantly turn the entire LED ring ON or OFF.
-* **Long Press (Hold 2 seconds):** Force disconnect! The device will drop the Bluetooth connection, flash Red, and immediately re-enter Pairing Mode.
+* **Long Press (Hold 2 seconds):** Alternative method to force disconnect and re-enter Pairing Mode.
 
 ### Touch Sensor 1 (Pin 20)
-* **Single Tap:** Play / Pause (Flashes Green)
-* **Double Tap:** Next Track (Flashes Orange)
-* **Triple Tap:** Previous Track (Flashes Magenta)
-* *Haptics:* Vibrates longer based on the number of taps!
+* **Single Tap:** Play / Pause
+* **Double Tap:** Next Track
+* **Triple Tap:** Previous Track
+* *Visuals & Haptics:* Plays a synchronized Fire Orange LED pulse and vibration for each tap registered.
 
 ### Touch Sensor 2 (Pin 21)
-* **Press:** Toggles **Brightness Mode**.
-  * The entire LED ring will fade in.
-  * While active, turning the knob adjusts the master LED brightness instead of media volume.
-  * **Press again** to confirm and exit (the ring will fade back out).
+* **Disabled by Default:** The brightness toggle mode has been disabled in the code settings per user preference, to avoid accidental touches. You can re-enable it in the settings block.
+
 
 ## LED Animations
 * **Boot:** Single slow "Fire Orange" breathing animation using sine wave math for a perfectly smooth fade to black.
 * **Pairing Mode:** Continuous slow Blue breathing animation.
-* **Connected (Idle):** All LEDs smoothly fade OFF after 1.5 seconds of inactivity.
-* **Connected (Active):** A single LED moves in the direction of your encoder rotation, leaving a tiny comet tail.
+* **Unpair Confirmation:** Smooth double-green breathing animation when the unpair sequence is triggered.
+* **Connected (Idle):** All LEDs smoothly fade OFF together synchronously after 1.5 seconds of inactivity using `setBrightness()` logic.
+* **Connected (Active):** A single LED moves in the direction of your encoder rotation, leaving a tiny comet tail. When interrupted mid-sleep, the full comet seamlessly restores.
 * **Connected (Muted):** Breathes Red continuously. The fade phase-shift is mathematically locked to the exact millisecond you press the button, ensuring it always fades in perfectly from zero brightness without flashing you in the eyes.
 
 ## Code Settings

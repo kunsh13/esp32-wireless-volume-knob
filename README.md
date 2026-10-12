@@ -1,5 +1,5 @@
-# esp32-wireless-volume-knob
-Esp32-c3 Wireless volume knob
+# Esp32-c3 Wireless volume knob
+
 
 
 [site]: [https://bit.ly/_iptv_](https://github.com/kunsh13/esp32-wireless-volume-knob/)
